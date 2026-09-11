@@ -11,22 +11,6 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 // ── Color Palette (production-grade dark theme) ──────────────────────────────
-const BG: Color = Color::Rgb(10, 12, 15);
-const BG_ELEVATED: Color = Color::Rgb(18, 22, 28);
-const BORDER: Color = Color::Rgb(30, 37, 48);
-const BORDER_ACTIVE: Color = Color::Rgb(59, 130, 246);
-const TEXT_PRIMARY: Color = Color::Rgb(226, 232, 240);
-const TEXT_SECONDARY: Color = Color::Rgb(148, 163, 184);
-const TEXT_DIM: Color = Color::Rgb(80, 90, 100);
-const GREEN: Color = Color::Rgb(74, 222, 128);
-const RED: Color = Color::Rgb(248, 113, 113);
-const RED_KILL: Color = Color::Rgb(180, 0, 0);
-const ORANGE: Color = Color::Rgb(249, 115, 22);
-const BLUE: Color = Color::Rgb(96, 165, 250);
-const PURPLE: Color = Color::Rgb(167, 139, 250);
-const CYAN: Color = Color::Rgb(0, 210, 220);
-const AMBER: Color = Color::Rgb(240, 180, 0);
-const YELLOW: Color = Color::Rgb(250, 204, 21);
 
 mod app;
 mod event_handler;
@@ -34,6 +18,7 @@ pub mod layout;
 mod live_feed;
 pub mod setup;
 pub mod state;
+pub mod theme;
 pub mod widgets;
 
 use app::App;
@@ -41,8 +26,140 @@ use common::models::exchange::ExchangeStatus;
 use live_feed::{spawn_binance_feed, LiveFeedEvent};
 use widgets::candlestick_widget::render_candlestick_chart;
 
+// Local palette aliases -> crate::theme (single source of truth).
+const AMBER: Color = theme::YELLOW;
+const BG: Color = theme::BG;
+const BG_ELEVATED: Color = theme::PANEL;
+const BLUE: Color = theme::BLUE;
+const BORDER: Color = theme::BORDER;
+const BORDER_ACTIVE: Color = theme::BLUE;
+const CYAN: Color = theme::CYAN;
+const GREEN: Color = theme::POSITIVE;
+const ORANGE: Color = theme::ORANGE;
+const PURPLE: Color = theme::PURPLE;
+const RED: Color = theme::NEGATIVE;
+const RED_KILL: Color = theme::NEGATIVE;
+const TEXT_DIM: Color = theme::TEXT_FAINT;
+const TEXT_PRIMARY: Color = theme::TEXT;
+const TEXT_SECONDARY: Color = theme::TEXT_DIM;
+const YELLOW: Color = theme::YELLOW;
+
+/// Why the interface might render without colour, decided before anything is
+/// drawn.
+///
+/// There are two independent ways every `Color::Rgb` in [`theme`] can be
+/// thrown away before it reaches the screen, and they need different fixes:
+///
+/// 1. **`NO_COLOR` is set.** crossterm implements <https://no-color.org/>: if
+///    `NO_COLOR` is set to any non-empty value it drops colour on the legacy
+///    WinAPI path and emits no SGR sequences at all. This is easy to hit
+///    without knowing it — many tool harnesses and CI runners export it for
+///    their own child processes, so the app inherits it and renders white
+///    through a terminal that is perfectly capable of true colour.
+/// 2. **No virtual-terminal processing.** On Windows crossterm must set
+///    `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the console handle. If that
+///    fails it falls back to a 16-colour WinAPI path and the palette
+///    collapses.
+///
+/// `NO_COLOR` is deliberately *honoured*, not overridden — it is a user
+/// preference and silently ignoring it would be user-hostile. Set
+/// `RUSTFORGE_FORCE_COLOR=1` to override it for this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColourSupport {
+    /// True colour is available; the palette renders as designed.
+    Full,
+    /// Suppressed by `NO_COLOR`, and not overridden.
+    DisabledByNoColor,
+    /// The console refused virtual-terminal processing.
+    NoVirtualTerminal,
+}
+
+impl ColourSupport {
+    fn detect() -> Self {
+        let no_color = std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty());
+        let forced = std::env::var("RUSTFORGE_FORCE_COLOR").is_ok_and(|v| !v.is_empty());
+
+        if no_color && !forced {
+            return Self::DisabledByNoColor;
+        }
+        if forced {
+            // Overrides NO_COLOR for *this* process only. Sets a static inside
+            // crossterm, which is why `tui` must depend on the same crossterm
+            // version as ratatui — see crates/tui/Cargo.toml.
+            crossterm::style::force_color_output(true);
+        }
+
+        #[cfg(windows)]
+        let vt = crossterm::ansi_support::supports_ansi();
+        #[cfg(not(windows))]
+        let vt = true;
+
+        if vt {
+            Self::Full
+        } else {
+            Self::NoVirtualTerminal
+        }
+    }
+
+    /// The actionable message, or `None` when colour is working.
+    fn advice(self) -> Option<&'static str> {
+        match self {
+            Self::Full => None,
+            Self::DisabledByNoColor => Some(
+                "NO_COLOR is set, so the interface is rendering without colour.\n\
+                 This is often inherited from a parent process rather than set by you.\n\
+                 Fix: run rustforge from a normal terminal, or override it with\n\
+                 \x20 RUSTFORGE_FORCE_COLOR=1",
+            ),
+            Self::NoVirtualTerminal => Some(
+                "This console does not support 24-bit colour, so the interface is\n\
+                 rendering without colour.\n\
+                 Fix: run inside Windows Terminal, or enable VT processing once with\n\
+                 \x20 reg add HKCU\\Console /v VirtualTerminalLevel /t REG_DWORD /d 1 /f",
+            ),
+        }
+    }
+}
+
+/// Decide colour support up front and leave a written trace of the decision.
+///
+/// The report goes to `tui-diagnostics.txt` in the working directory so a
+/// "why is it all white?" report can be answered from a file instead of a
+/// guess.
+fn init_colour_support() -> ColourSupport {
+    let support = ColourSupport::detect();
+
+    let report = format!(
+        "colour_support        = {support:?}\n\
+         NO_COLOR              = {:?}\n\
+         RUSTFORGE_FORCE_COLOR = {:?}\n\
+         TERM                  = {:?}\n\
+         COLORTERM             = {:?}\n\
+         WT_SESSION            = {:?}\n\
+         stdout_is_tty         = {}\n\
+         \n\
+         DisabledByNoColor -> crossterm is honouring https://no-color.org/ and\n\
+         emitting no SGR sequences; override with RUSTFORGE_FORCE_COLOR=1.\n\
+         NoVirtualTerminal -> crossterm is using the legacy 16-colour WinAPI\n\
+         path and every Color::Rgb in the theme is being discarded.\n",
+        std::env::var("NO_COLOR").ok(),
+        std::env::var("RUSTFORGE_FORCE_COLOR").ok(),
+        std::env::var("TERM").ok(),
+        std::env::var("COLORTERM").ok(),
+        std::env::var("WT_SESSION").ok(),
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    );
+    let _ = std::fs::write("tui-diagnostics.txt", &report);
+
+    if let Some(advice) = support.advice() {
+        eprintln!("\n[rustforge] {advice}\n");
+    }
+    support
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_colour_support();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -316,7 +433,7 @@ fn draw_kill_switch_overlay(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(RED).add_modifier(Modifier::BOLD))
         .border_type(BorderType::Double)
-        .style(Style::default().bg(Color::Rgb(30, 0, 0)));
+        .style(Style::default().bg(theme::NEGATIVE_DEEP));
 
     let inner = inner_block.inner(center);
     f.render_widget(inner_block, center);
@@ -399,7 +516,7 @@ fn draw_kill_switch_overlay(f: &mut Frame, app: &App) {
             Span::styled(
                 " HALTED ",
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme::BG)
                     .bg(RED)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -407,7 +524,7 @@ fn draw_kill_switch_overlay(f: &mut Frame, app: &App) {
             Span::styled(
                 " ALL VENUES DISCONNECTED ",
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme::BG)
                     .bg(ORANGE)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -421,7 +538,7 @@ fn draw_kill_switch_overlay(f: &mut Frame, app: &App) {
     ];
 
     f.render_widget(
-        Paragraph::new(text).style(Style::default().bg(Color::Rgb(30, 0, 0))),
+        Paragraph::new(text).style(Style::default().bg(theme::NEGATIVE_DEEP)),
         inner,
     );
 }
@@ -474,7 +591,7 @@ fn draw_dialog(f: &mut Frame, app: &App) {
             Span::styled(
                 format!(" {} ", t.label()),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme::BG)
                     .bg(border_color)
                     .add_modifier(Modifier::BOLD),
             )
@@ -1006,7 +1123,7 @@ fn draw_dexter_analyst(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             " BUY ",
             Style::default()
-                .fg(Color::Black)
+                .fg(theme::BG)
                 .bg(GREEN)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -1014,7 +1131,7 @@ fn draw_dexter_analyst(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             " RISK ",
             Style::default()
-                .fg(Color::Black)
+                .fg(theme::BG)
                 .bg(RED)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -1022,7 +1139,7 @@ fn draw_dexter_analyst(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             " NEUTRAL ",
             Style::default()
-                .fg(Color::Black)
+                .fg(theme::BG)
                 .bg(AMBER)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -1214,7 +1331,7 @@ fn draw_order_entry(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             " BUY ",
             Style::default()
-                .fg(Color::Black)
+                .fg(theme::BG)
                 .bg(GREEN)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -1222,7 +1339,7 @@ fn draw_order_entry(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             " SELL ",
             Style::default()
-                .fg(Color::White)
+                .fg(theme::TEXT)
                 .bg(RED)
                 .add_modifier(Modifier::BOLD),
         ),
