@@ -3,6 +3,12 @@
 //!
 //! API docs: <https://fxmacrodata.com/documentation>
 //! Base URL: `https://api.fxmacrodata.com/v1`
+//!
+//! History endpoints (announcements, predictions, forex, COT, commodities,
+//! rate differentials, risk sentiment) return one page per call: 20 rows by
+//! default, at most 100 via `("limit", ..)`, newest first. Pass `("offset", ..)`
+//! to read further back; the response `pagination` object carries `has_more`
+//! and `next_offset`.
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
