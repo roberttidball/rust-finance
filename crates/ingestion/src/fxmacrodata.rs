@@ -66,8 +66,14 @@ impl FxMacroDataClient {
 
     /// Create with an explicit API key and base URL.
     pub fn with_base_url(api_key: impl Into<String>, base_url: &str) -> Result<Self> {
+        // Redirects are not followed, so the X-API-Key header is never sent to
+        // another host; a 3xx surfaces as an HTTP error from parse_response.
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build FXMacroData HTTP client")?;
         Ok(Self {
-            client: Client::new(),
+            client,
             api_key: api_key.into(),
             base_url: Url::parse(base_url).context("invalid FXMacroData base URL")?,
         })
